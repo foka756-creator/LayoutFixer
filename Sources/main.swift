@@ -104,6 +104,92 @@ enum Typer {
     }
 }
 
+// MARK: - Всплывающее предложение после отката
+
+/// Небольшая панель у курсора ввода: «Добавить «слово» в исключения». Не забирает фокус,
+/// закрывается сама через несколько секунд или при следующем нажатии клавиши.
+final class ExceptionPopup: NSObject {
+    private var panel: NSPanel?
+    private var timer: Timer?
+    private var onAdd: (() -> Void)?
+
+    func show(word: String, onAdd: @escaping () -> Void) {
+        hide()
+        self.onAdd = onAdd
+        let button = NSButton(title: "Добавить «\(word)» в исключения", target: self, action: #selector(add))
+        button.bezelStyle = .rounded
+        button.sizeToFit()
+        let size = NSSize(width: button.frame.width + 20, height: button.frame.height + 16)
+        button.frame.origin = NSPoint(x: 10, y: 8)
+
+        let p = NSPanel(contentRect: NSRect(origin: .zero, size: size),
+                        styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.level = .popUpMenu
+        p.isFloatingPanel = true
+        p.hidesOnDeactivate = false
+        p.hasShadow = true
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        let bg = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        bg.material = .menu
+        bg.state = .active
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 8
+        bg.addSubview(button)
+        p.contentView = bg
+        p.setFrameOrigin(origin(for: size))
+        p.orderFrontRegardless()
+        panel = p
+        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in self?.hide() }
+    }
+
+    /// Клик по самой панели не должен её закрывать.
+    func contains(_ point: NSPoint) -> Bool { panel?.frame.contains(point) ?? false }
+
+    func hide() {
+        timer?.invalidate(); timer = nil
+        panel?.orderOut(nil); panel = nil
+        onAdd = nil
+    }
+
+    @objc private func add() {
+        let done = onAdd
+        hide()
+        done?()
+    }
+
+    /// Под курсором ввода (через Accessibility); если не получилось — рядом с указателем мыши.
+    private func origin(for size: NSSize) -> NSPoint {
+        var anchor = NSEvent.mouseLocation
+        var below: CGFloat = 24
+        if let r = caretRect() { anchor = NSPoint(x: r.minX, y: r.minY); below = 6 }
+        var o = NSPoint(x: anchor.x, y: anchor.y - size.height - below)
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(anchor) }) ?? NSScreen.main {
+            o.x = min(max(o.x, screen.visibleFrame.minX), screen.visibleFrame.maxX - size.width)
+            o.y = min(max(o.y, screen.visibleFrame.minY), screen.visibleFrame.maxY - size.height)
+        }
+        return o
+    }
+
+    private func caretRect() -> NSRect? {
+        let sys = AXUIElementCreateSystemWide()
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+              let el = focused else { return nil }
+        var range: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el as! AXUIElement, kAXSelectedTextRangeAttribute as CFString, &range) == .success,
+              let r = range else { return nil }
+        var bounds: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(el as! AXUIElement, kAXBoundsForRangeParameterizedAttribute as CFString,
+                                                         r, &bounds) == .success, let b = bounds else { return nil }
+        var rect = CGRect.zero
+        guard AXValueGetValue(b as! AXValue, .cgRect, &rect), rect != .zero else { return nil }
+        // AX отдаёт координаты от верхнего левого угла главного экрана, AppKit — от нижнего левого.
+        let h = NSScreen.screens.first?.frame.height ?? 0
+        return NSRect(x: rect.minX, y: h - rect.maxY, width: rect.width, height: rect.height)
+    }
+}
+
 // MARK: - Слушатель клавиатуры
 
 final class KeyWatcher {
@@ -112,6 +198,7 @@ final class KeyWatcher {
     private var generation = 0
     private var history = FixHistory()
     private let checker = SpellChecker()
+    private let popup = ExceptionPopup()
     var onFix: (() -> Void)?
 
     func start() -> Bool {
@@ -140,7 +227,9 @@ final class KeyWatcher {
         }
         guard Prefs.enabled else { buffer.reset(); return }
         if event.getIntegerValueField(.eventSourceUserData) == Typer.marker { return }
+        if type != .keyDown, popup.contains(NSEvent.mouseLocation) { return }
         generation += 1
+        popup.hide()
         if type != .keyDown { buffer.reset(); history.clear(); return }
 
         let flags = event.flags
@@ -184,10 +273,14 @@ final class KeyWatcher {
             Typer.backspace(fix.replacement.count)
             Typer.type(fix.original)
             if Prefs.switchLayout { Layouts.select(fix.target.other) }
-            Prefs.ignored.insert(LayoutFix.ignoreKey(fix.original))
             Prefs.fixed = max(0, Prefs.fixed - 1)
             self.buffer.reset()
             self.onFix?()
+            // Слово в исключения попадает только по явному согласию.
+            self.popup.show(word: fix.original) { [weak self] in
+                Prefs.ignored.insert(LayoutFix.ignoreKey(fix.original))
+                self?.onFix?()
+            }
         }
     }
 
